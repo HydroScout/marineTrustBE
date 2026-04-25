@@ -156,12 +156,6 @@ def get_ship(ship_id: int):
         raise HTTPException(404, f"Ship {ship_id} not found")
     return ShipMeta(**registry[ship_id])
 
-
-@app.get("/spills")
-def get_spills():
-    return {}
-
-
 @app.get("/spills/{date}", response_model=list[SimulationResult])
 def get_spills_on_date(date: str):
     try:
