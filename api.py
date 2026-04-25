@@ -80,6 +80,22 @@ def get_spills_on_date(date: str):
                 output_step_s=SPILL_OUTPUT_STEP_S,
             ),
         )
-        animations.append(mock_simulate(req))
+        result = mock_simulate(req)
+
+        kept_frames = []
+        new_seed_index = -1
+        for i, frame in enumerate(result.frames):
+            if frame.time.date() != target:
+                continue
+            if i == result.seed_frame_index:
+                new_seed_index = len(kept_frames)
+            kept_frames.append(frame)
+
+        if not kept_frames:
+            continue
+
+        result.frames = kept_frames
+        result.seed_frame_index = new_seed_index
+        animations.append(result)
 
     return animations
