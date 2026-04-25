@@ -1,7 +1,34 @@
 """HTTP API."""
 
-from fastapi import FastAPI
+import json as _json
+from datetime import datetime
+from pathlib import Path
+
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from shapely.geometry import Point, shape
+from shapely.ops import unary_union
+
+from csv_to_json import csv_to_route
+from schemas import FlaggedShipsResponse, ShipMeta, ShipRouteResponse
+
+
+# ---------------------------------------------------------------------------
+# Filesystem layout
+#
+#   data/ships/ships.json                   registry [{"id": int, "name": str, "type": str}, ...]
+#   data/flagged_ships/flagged_ships.json   {"ids": [int, ...]}
+#   data/routes/<filename>.csv              MarineTraffic CSV with leading
+#                                           `id` column; one file may hold
+#                                           rows for many ships (filtered by id).
+#   data/spills/*.json                      GeoJSON Polygon (one file per spill)
+# ---------------------------------------------------------------------------
+
+DATA_DIR = Path(__file__).parent / "data"
+SHIPS_REGISTRY = DATA_DIR / "ships" / "ships.json"
+FLAGGED_INDEX = DATA_DIR / "flagged_ships" / "flagged_ships.json"
+SPILLS_DIR = DATA_DIR / "spills"
+# Routes live under `data/routes/` and are read via `csv_to_json.csv_to_route`.
 
 
 app = FastAPI(title="MarineTrust API", version="0.1.0")
@@ -14,19 +41,102 @@ app.add_middleware(
 )
 
 
-@app.get("/ships/{ship_id}/{date}")
-def get_ship_on_date(ship_id: str, date: str):
-    return {}
+# ---------------------------------------------------------------------------
+# Loaders. Re-read on every request — files are tiny and edits should be live.
+# ---------------------------------------------------------------------------
+
+def _load_ships_registry() -> dict[int, dict]:
+    """Index ships.json by integer id."""
+    if not SHIPS_REGISTRY.exists():
+        return {}
+    with open(SHIPS_REGISTRY) as f:
+        return {int(s["id"]): s for s in _json.load(f)}
 
 
-@app.get("/ships/{ship_id}")
-def get_ship(ship_id: str):
-    return {}
+def _load_spill_geom():
+    """Union of all spill polygons in `data/spills/`. None when none exist."""
+    if not SPILLS_DIR.exists():
+        return None
+    geoms = []
+    for p in sorted(SPILLS_DIR.glob("*.json")):
+        with open(p) as f:
+            geoms.append(shape(_json.load(f)))
+    if not geoms:
+        return None
+    return geoms[0] if len(geoms) == 1 else unary_union(geoms)
 
 
-@app.get("/flaggedShips")
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/flaggedShips", response_model=FlaggedShipsResponse)
 def get_flagged_ships():
-    return {}
+    """Read `data/flagged_ships/flagged_ships.json` and return its `ids` list."""
+    if not FLAGGED_INDEX.exists():
+        return FlaggedShipsResponse(ids=[])
+    with open(FLAGGED_INDEX) as f:
+        data = _json.load(f)
+    raw = data.get("ids", [])
+    # Tolerate a single int/str instead of a list (hand-edited demo data).
+    if isinstance(raw, (str, int)):
+        raw = [raw]
+    return FlaggedShipsResponse(ids=[int(x) for x in raw])
+
+
+@app.get("/ships/{ship_id}/{date}", response_model=ShipRouteResponse)
+def get_ship_on_date(ship_id: int, date: str):
+    """
+    Route of the ship on a UTC calendar date with per-point collision flags.
+
+    Path:
+      ship_id  - integer id from `ships.json`
+      date     - YYYY-MM-DD, interpreted as UTC
+
+    Status codes:
+      400 - invalid date format
+      404 - unknown ship, no route file, or no fixes on that date
+    """
+    try:
+        target = datetime.strptime(date, "%Y-%m-%d").date()
+    except ValueError:
+        raise HTTPException(400, f"Invalid date '{date}'; expected YYYY-MM-DD")
+
+    registry = _load_ships_registry()
+    if ship_id not in registry:
+        raise HTTPException(404, f"Ship {ship_id} not found")
+
+    # csv_to_json.csv_to_route does the CSV scanning, id-filtering, masked-row
+    # dropping, sorting, and date filtering. We just add a parallel `collisions`
+    # array so the response matches the ship_track.json shape on disk.
+    route = csv_to_route(ship_id, target_date=target)
+    coordinates = route["coordinates"]
+    if not coordinates:
+        raise HTTPException(404, f"No fixes for ship {ship_id} on {target.isoformat()}")
+
+    # Per-point collision: is this fix inside any spill polygon?
+    spill_geom = _load_spill_geom()
+    if spill_geom is None:
+        collisions = [False] * len(coordinates)
+    else:
+        collisions = [spill_geom.contains(Point(lon, lat)) for lon, lat in coordinates]
+
+    return ShipRouteResponse(
+        timestamps=route["timestamps"],
+        coordinates=coordinates,
+        speeds=route["speeds"],
+        courses=route["courses"],
+        collisions=collisions,
+    )
+
+
+@app.get("/ships/{ship_id}", response_model=ShipMeta)
+def get_ship(ship_id: int):
+    """Registry entry for a single ship."""
+    registry = _load_ships_registry()
+    if ship_id not in registry:
+        raise HTTPException(404, f"Ship {ship_id} not found")
+    return ShipMeta(**registry[ship_id])
 
 
 @app.get("/spills")

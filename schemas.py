@@ -123,3 +123,43 @@ class SimulationResult(BaseModel):
     # OpenDrift writes via run(outfile=...). Mock returns a placeholder path.
     netcdf_url: Optional[str] = None
     oil_budget: Optional[dict[str, float]] = None
+
+
+# ---------------------------------------------------------------------------
+# Ship route + collision response schemas (used by api.py).
+# ---------------------------------------------------------------------------
+
+class ShipMeta(BaseModel):
+    """Returned by GET /ships/{ship_id} — passthrough of the registry entry."""
+    id: int
+    name: str
+    type: str
+
+
+class ShipRouteResponse(BaseModel):
+    """
+    Returned by GET /ships/{ship_id}/{date}.
+
+    Same column-oriented layout as the standalone `ship_track.json` produced
+    by `csv_to_json.main()`, with the extra `collisions` array. The i-th
+    element of every list refers to the same fix, so the frontend can index
+    by frame for animation:
+
+        timestamps[i]   ISO 8601 UTC string
+        coordinates[i]  [lon, lat] (GeoJSON convention)
+        speeds[i]       knots; None when the source row was masked
+        courses[i]      degrees true; None when masked
+        collisions[i]   True iff that fix lies inside any spill polygon
+
+    Rows whose lat/lon were "masked" are dropped — every output entry has
+    a real position.
+    """
+    timestamps: list[str]
+    coordinates: list[list[float]]
+    speeds: list[Optional[float]]
+    courses: list[Optional[float]]
+    collisions: list[bool]
+
+
+class FlaggedShipsResponse(BaseModel):
+    ids: list[int]
