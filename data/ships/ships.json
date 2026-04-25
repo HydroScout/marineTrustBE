@@ -1,0 +1,12 @@
+[
+    {
+        "id": 1,
+        "name": "The Forres",
+        "type": "tanker"
+    },
+    {
+        "id": 2,
+        "name": "Flamingo",
+        "type": "cargo"
+    }
+]
