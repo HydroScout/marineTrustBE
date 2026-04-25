@@ -24,7 +24,7 @@ from typing import Literal, Optional
 from fastapi import BackgroundTasks, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from shapely.geometry import Point, shape
+from shapely.geometry import Point, Polygon as ShapelyPolygon, shape
 from shapely.strtree import STRtree
 
 
@@ -34,10 +34,20 @@ from shapely.strtree import STRtree
 # ---------------------------------------------------------------------------
 
 class Seed(BaseModel):
-    # PROVIDE: release point + how much you're releasing.
-    lon: float = Field(..., description="Release longitude (WGS84)")
-    lat: float = Field(..., description="Release latitude (WGS84)")
-    radius_m: float = Field(1000, description="1-sigma release spread, meters")
+    # PROVIDE: where you're releasing oil.
+    # Two modes (mutually exclusive):
+    #   - point seed: lon + lat + radius_m (Gaussian cloud at the point)
+    #   - polygon seed: polygon (uniform fill of the polygon's outer ring)
+    # Real OpenDrift exposes both: seed_elements(lon, lat, radius=...) for
+    # point releases and seed_within_polygon(lons, lats, ...) for area releases.
+    lon: Optional[float] = Field(None, description="Release longitude (point mode)")
+    lat: Optional[float] = Field(None, description="Release latitude (point mode)")
+    radius_m: float = Field(1000, description="1-sigma release spread, meters (point mode)")
+    polygon: Optional[list[list[list[float]]]] = Field(
+        None,
+        description="GeoJSON Polygon coordinates: [[[lon, lat], ...]]. "
+                    "If set, particles uniformly fill the outer ring; lon/lat/radius_m are ignored."
+    )
     number: int = Field(1000, ge=10, le=50000, description="Particle count")
     time: datetime = Field(..., description="Release time, UTC")
     z: float = Field(0, description="Depth in meters. 0 = surface.")
@@ -116,8 +126,12 @@ class TrajectoryFrame(BaseModel):
 class SimulationResult(BaseModel):
     job_id: str
     model: str
+    # Centroid (point mode: the seed point itself; polygon mode: polygon centroid).
     seed_lon: float
     seed_lat: float
+    # The polygon used for area-fill seeding (if any). Frontend draws this
+    # on the map to show where particles were released.
+    seed_polygon: Optional[list[list[list[float]]]] = None
     # Index into `frames` of the seed time (t=0). Frames before are backward
     # in time, frames after are forward. Frontend uses this to label the slider.
     seed_frame_index: int = 0
@@ -273,25 +287,56 @@ def _make_frame(t, lats, lons, statuses, masses, model) -> TrajectoryFrame:
 
 
 def _mock_simulate(req: SimulationRequest) -> SimulationResult:
-    rng = random.Random(int(req.seed.lon * 1000 + req.seed.lat * 1000))
     n = req.seed.number
-    radius_deg = req.seed.radius_m / 111_000  # ~111 km / degree latitude
-    cos_lat = math.cos(math.radians(req.seed.lat))
 
-    # Gaussian release cloud at t=0.
-    init_lats = [req.seed.lat + rng.gauss(0, radius_deg) for _ in range(n)]
-    init_lons = [req.seed.lon + rng.gauss(0, radius_deg / cos_lat) for _ in range(n)]
+    # ---- Seed the initial cloud --------------------------------------------
+    # Two modes: polygon (uniform fill) or point (Gaussian cloud).
+    if req.seed.polygon:
+        # Polygon mode — uniform fill via rejection sampling on the bounding box.
+        # Real OpenDrift: o.seed_within_polygon(lons=poly_lons, lats=poly_lats, ...).
+        ring = req.seed.polygon[0]                         # outer ring [[lon, lat], ...]
+        holes = req.seed.polygon[1:] if len(req.seed.polygon) > 1 else None
+        poly_geom = ShapelyPolygon(ring, holes=holes)
+        if not poly_geom.is_valid or poly_geom.is_empty:
+            raise ValueError("Invalid or empty seed polygon")
+        centroid = poly_geom.centroid
+        seed_lon, seed_lat = centroid.x, centroid.y
+        rng = random.Random(int((seed_lon + 180) * 1000 + (seed_lat + 90) * 1000))
+        minx, miny, maxx, maxy = poly_geom.bounds
+        init_lons, init_lats = [], []
+        # Cap attempts to avoid infinite loops on bad polygons.
+        max_attempts = max(n * 50, 10_000)
+        attempts = 0
+        while len(init_lons) < n and attempts < max_attempts:
+            x = rng.uniform(minx, maxx)
+            y = rng.uniform(miny, maxy)
+            if poly_geom.contains(Point(x, y)):
+                init_lons.append(x)
+                init_lats.append(y)
+            attempts += 1
+        if len(init_lons) < n:
+            raise ValueError(f"Could only seed {len(init_lons)}/{n} particles in polygon")
+    elif req.seed.lon is not None and req.seed.lat is not None:
+        # Point mode — Gaussian cloud.
+        seed_lon, seed_lat = req.seed.lon, req.seed.lat
+        rng = random.Random(int(seed_lon * 1000 + seed_lat * 1000))
+        radius_deg = req.seed.radius_m / 111_000
+        cos_lat0 = math.cos(math.radians(seed_lat))
+        init_lats = [seed_lat + rng.gauss(0, radius_deg) for _ in range(n)]
+        init_lons = [seed_lon + rng.gauss(0, radius_deg / cos_lat0) for _ in range(n)]
+    else:
+        raise ValueError("Seed must include either 'polygon' or both 'lon' and 'lat'")
 
     output_step_h = req.run.output_step_s / 3600
     n_back = int(req.run.duration_back_hours / output_step_h)
     n_fwd = int(req.run.duration_forward_hours / output_step_h)
-    dt_s = req.run.output_step_s  # per-output-step duration in seconds
+    dt_s = req.run.output_step_s
 
     evap_rate = 0.02 if req.model == "OpenOil" else 0.0
 
     def advect(lon, lat, sign):
         """Move one particle by one output-step; sign=+1 forward, -1 backward."""
-        u_mps, v_mps = _current(lon, lat, req.seed.lon, req.seed.lat)
+        u_mps, v_mps = _current(lon, lat, seed_lon, seed_lat)
         cos_lat_i = math.cos(math.radians(lat))
         d_lon = sign * u_mps * dt_s / (111_000 * cos_lat_i) + rng.gauss(0, 0.0008)
         d_lat = sign * v_mps * dt_s / 111_000 + rng.gauss(0, 0.0008)
@@ -355,8 +400,9 @@ def _mock_simulate(req: SimulationRequest) -> SimulationResult:
     return SimulationResult(
         job_id="",
         model=req.model,
-        seed_lon=req.seed.lon,
-        seed_lat=req.seed.lat,
+        seed_lon=seed_lon,
+        seed_lat=seed_lat,
+        seed_polygon=req.seed.polygon,
         seed_frame_index=seed_frame_index,
         frames=frames,
         oil_budget=oil_budget,
