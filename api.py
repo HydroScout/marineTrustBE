@@ -45,12 +45,6 @@ def get_ship(ship_id: str):
 def get_flagged_ships():
     return {}
 
-
-@app.get("/spills")
-def get_spills():
-    return {}
-
-
 @app.get("/spills/{date}", response_model=list[SimulationResult])
 def get_spills_on_date(date: str):
     try:
