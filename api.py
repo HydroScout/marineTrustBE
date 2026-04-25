@@ -66,23 +66,48 @@ SPILL_TYPE_MAP: dict[str, tuple[str, str | None]] = {
 }
 
 
-@app.get("/ships/{ship_id}/{date}")
-def get_ship_on_date(ship_id: str, date: str):
-    return {}
-
-
 def _load_spill_geom():
     """Union of all spill polygons in `data/spills/`. None when none exist."""
     if not SPILLS_DIR.exists():
         return None
+        
     geoms = []
     for p in sorted(SPILLS_DIR.glob("*.json")):
         with open(p) as f:
-            geoms.append(shape(_json.load(f)))
+            data = _json.load(f)
+            
+        # 1. Normalize everything into a list so we don't need messy nested if-statements
+        if isinstance(data, dict):
+            if data.get("type") == "FeatureCollection":
+                data = data.get("features", [])
+            else:
+                data = [data]
+                
+        # 2. Parse the list safely
+        if isinstance(data, list):
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                
+                # Case A: It's a standard GeoJSON Feature
+                if item.get("type") == "Feature" and "geometry" in item:
+                    geoms.append(shape(item["geometry"]))
+                
+                # Case B: It's a raw standard geometry (Polygon, MultiPolygon, Point, etc.)
+                elif item.get("type") in ["Polygon", "MultiPolygon", "Point", "LineString"]:
+                    geoms.append(shape(item))
+                
+                # Case C: It's your custom format (e.g. "type": "Oil", "coordinates": [...])
+                # We ignore the word "Oil" and force it into a valid Shapely Polygon format
+                elif "coordinates" in item:
+                    geoms.append(shape({
+                        "type": "Polygon", 
+                        "coordinates": item["coordinates"]
+                    }))
+
     if not geoms:
         return None
     return geoms[0] if len(geoms) == 1 else unary_union(geoms)
-
 
 # ---------------------------------------------------------------------------
 # Endpoints
@@ -115,6 +140,13 @@ def get_ship_on_date(ship_id: int, date: str):
       400 - invalid date format
       404 - unknown ship, no route file, or no fixes on that date
     """
+    # Open the file in read mode
+    with open('data/ship_tracks/1.json', 'r') as file:
+        # Parse the JSON file into a Python dictionary
+        data = json.load(file)
+        
+    return data
+
     try:
         target = datetime.strptime(date, "%Y-%m-%d").date()
     except ValueError:
