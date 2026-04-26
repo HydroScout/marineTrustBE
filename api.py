@@ -28,6 +28,10 @@ SPILLS_PATH = Path(__file__).parent / "data" / "spills" / "spills.json"
 ROUTES_DIR = Path(__file__).parent / "data" / "routes"
 SHIPS_PATH = Path(__file__).parent / "data" / "ships" / "ships.json"
 FLAGGED_SHIPS_PATH = Path(__file__).parent / "data" / "flagged_ships" / "flagged_ships.json"
+# Short-term CPU optimization: precomputed responses served instead of running
+# the simulator on every request. Remove once compute capacity is restored.
+SHIP_TRACKS_CACHE_PATH = Path(__file__).parent / "data" / "CPUShortage" / "ShipTracks.json"
+OIL_SPILL_ANIM_CACHE_PATH = Path(__file__).parent / "data" / "CPUShortage" / "oilSpillAnimation.json"
 SPILL_WINDOW_HOURS = 60
 SPILL_OUTPUT_STEP_S = 1800  # 30 min frames
 
@@ -78,63 +82,67 @@ def _closest_frame_index(frame_times: list[datetime], ts: datetime) -> int:
 
 @app.get("/ships/{ship_id}/{date}")
 def get_ship_on_date(ship_id: str, date: str):
-    try:
-        datetime.strptime(date, "%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD")
+    # Short-term CPU optimization: serve precomputed track from
+    # data/CPUShortage/ShipTracks.json instead of running the per-request
+    # simulation below. Restore the original logic when compute is available.
+    with open(SHIP_TRACKS_CACHE_PATH) as f:
+        cached = json.load(f)
+    for entry in cached:
+        if str(entry["id"]) == str(ship_id):
+            return entry["track"]
+    raise HTTPException(status_code=404, detail="No cached track for ship")
 
-    route = build_ship_route(ROUTES_DIR, ship_id, date)
-    if route is None:
-        raise HTTPException(status_code=404, detail="No route data for ship/date")
-
-    ship_times = [
-        datetime.strptime(ts.rstrip("Z"), "%Y-%m-%dT%H:%M:%S")
-        for ts in route["timestamps"]
-    ]
-    ship_min, ship_max = ship_times[0], ship_times[-1]
-
-    with open(SPILLS_PATH) as f:
-        spills = json.load(f)
-
-    # Run simulations only for spills whose animation window overlaps the
-    # ship's timestamps. Cache hulls lazily — most ship coords map to the same
-    # frame index, so we don't want to rebuild a hull per query.
-    sims: list[tuple[list[datetime], list, list]] = []
-    for spill in spills:
-        spill_time = datetime.fromisoformat(spill["dateTime"])
-        anim_start = spill_time - timedelta(hours=SPILL_WINDOW_HOURS)
-        anim_end = spill_time + timedelta(hours=SPILL_WINDOW_HOURS)
-        if anim_end < ship_min or anim_start > ship_max:
-            continue
-        result = _simulate_spill(spill)
-        frame_times = [f.time for f in result.frames]
-        hulls: list = [None] * len(result.frames)
-        sims.append((frame_times, result.frames, hulls))
-
-    collisions: list[bool] = []
-    for ts, (lon, lat) in zip(ship_times, route["coordinates"]):
-        point = Point(lon, lat)
-        hit = False
-        for frame_times, frames, hulls in sims:
-            if ts < frame_times[0] or ts > frame_times[-1]:
-                continue
-            idx = _closest_frame_index(frame_times, ts)
-            if hulls[idx] is None:
-                hulls[idx] = _cloud_hull(frames[idx])
-            hull = hulls[idx]
-            if hull is not None and hull.contains(point):
-                hit = True
-                break
-        collisions.append(hit)
-
-    # shifted = [False] * len(collisions)
-    # for i, hit in enumerate(collisions):
-    #     if hit and i + 1 < len(collisions):
-    #         shifted[i + 1] = True
-    # collisions = shifted
-
-    route["collisions"] = collisions
-    return route
+    # try:
+    #     datetime.strptime(date, "%Y-%m-%d")
+    # except ValueError:
+    #     raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD")
+    #
+    # route = build_ship_route(ROUTES_DIR, ship_id, date)
+    # if route is None:
+    #     raise HTTPException(status_code=404, detail="No route data for ship/date")
+    #
+    # ship_times = [
+    #     datetime.strptime(ts.rstrip("Z"), "%Y-%m-%dT%H:%M:%S")
+    #     for ts in route["timestamps"]
+    # ]
+    # ship_min, ship_max = ship_times[0], ship_times[-1]
+    #
+    # with open(SPILLS_PATH) as f:
+    #     spills = json.load(f)
+    #
+    # # Run simulations only for spills whose animation window overlaps the
+    # # ship's timestamps. Cache hulls lazily — most ship coords map to the same
+    # # frame index, so we don't want to rebuild a hull per query.
+    # sims: list[tuple[list[datetime], list, list]] = []
+    # for spill in spills:
+    #     spill_time = datetime.fromisoformat(spill["dateTime"])
+    #     anim_start = spill_time - timedelta(hours=SPILL_WINDOW_HOURS)
+    #     anim_end = spill_time + timedelta(hours=SPILL_WINDOW_HOURS)
+    #     if anim_end < ship_min or anim_start > ship_max:
+    #         continue
+    #     result = _simulate_spill(spill)
+    #     frame_times = [f.time for f in result.frames]
+    #     hulls: list = [None] * len(result.frames)
+    #     sims.append((frame_times, result.frames, hulls))
+    #
+    # collisions: list[bool] = []
+    # for ts, (lon, lat) in zip(ship_times, route["coordinates"]):
+    #     point = Point(lon, lat)
+    #     hit = False
+    #     for frame_times, frames, hulls in sims:
+    #         if ts < frame_times[0] or ts > frame_times[-1]:
+    #             continue
+    #         idx = _closest_frame_index(frame_times, ts)
+    #         if hulls[idx] is None:
+    #             hulls[idx] = _cloud_hull(frames[idx])
+    #         hull = hulls[idx]
+    #         if hull is not None and hull.contains(point):
+    #             hit = True
+    #             break
+    #     collisions.append(hit)
+    #
+    # route["collisions"] = collisions
+    # return route
 
 
 @app.get("/ships/{ship_id}")
@@ -154,43 +162,59 @@ def get_flagged_ships():
         if ship["id"] in flagged
     ]
 
-@app.get("/spills/{date}", response_model=list[SimulationResult])
+@app.get("/spills/{date}")
 def get_spills_on_date(date: str):
+    # Short-term CPU optimization: serve the precomputed animation array from
+    # data/CPUShortage/oilSpillAnimation.json keyed by date, instead of running
+    # the simulator on every request. Restore the original logic when compute
+    # is available.
     try:
         target = datetime.strptime(date, "%Y-%m-%d").date()
     except ValueError:
         raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD")
 
-    day_start = datetime.combine(target, datetime.min.time())
-    day_end = day_start + timedelta(days=1)
+    with open(OIL_SPILL_ANIM_CACHE_PATH) as f:
+        cached = json.load(f)
+    for entry in cached:
+        if datetime.fromisoformat(entry["date"]).date() == target:
+            return entry["animation"]
+    raise HTTPException(status_code=404, detail="No cached animation for date")
 
-    with open(SPILLS_PATH) as f:
-        spills = json.load(f)
-
-    animations: list[SimulationResult] = []
-    for spill in spills:
-        spill_time = datetime.fromisoformat(spill["dateTime"])
-        anim_start = spill_time - timedelta(hours=SPILL_WINDOW_HOURS)
-        anim_end = spill_time + timedelta(hours=SPILL_WINDOW_HOURS)
-        if anim_end < day_start or anim_start >= day_end:
-            continue
-
-        result = _simulate_spill(spill)
-
-        kept_frames = []
-        new_seed_index = -1
-        for i, frame in enumerate(result.frames):
-            if frame.time.date() != target:
-                continue
-            if i == result.seed_frame_index:
-                new_seed_index = len(kept_frames)
-            kept_frames.append(frame)
-
-        if not kept_frames:
-            continue
-
-        result.frames = kept_frames
-        result.seed_frame_index = new_seed_index
-        animations.append(result)
-
-    return animations
+    # try:
+    #     target = datetime.strptime(date, "%Y-%m-%d").date()
+    # except ValueError:
+    #     raise HTTPException(status_code=400, detail="Date must be YYYY-MM-DD")
+    #
+    # day_start = datetime.combine(target, datetime.min.time())
+    # day_end = day_start + timedelta(days=1)
+    #
+    # with open(SPILLS_PATH) as f:
+    #     spills = json.load(f)
+    #
+    # animations: list[SimulationResult] = []
+    # for spill in spills:
+    #     spill_time = datetime.fromisoformat(spill["dateTime"])
+    #     anim_start = spill_time - timedelta(hours=SPILL_WINDOW_HOURS)
+    #     anim_end = spill_time + timedelta(hours=SPILL_WINDOW_HOURS)
+    #     if anim_end < day_start or anim_start >= day_end:
+    #         continue
+    #
+    #     result = _simulate_spill(spill)
+    #
+    #     kept_frames = []
+    #     new_seed_index = -1
+    #     for i, frame in enumerate(result.frames):
+    #         if frame.time.date() != target:
+    #             continue
+    #         if i == result.seed_frame_index:
+    #             new_seed_index = len(kept_frames)
+    #         kept_frames.append(frame)
+    #
+    #     if not kept_frames:
+    #         continue
+    #
+    #     result.frames = kept_frames
+    #     result.seed_frame_index = new_seed_index
+    #     animations.append(result)
+    #
+    # return animations
