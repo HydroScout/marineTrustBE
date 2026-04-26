@@ -127,11 +127,11 @@ def get_ship_on_date(ship_id: str, date: str):
                 break
         collisions.append(hit)
 
-    shifted = [False] * len(collisions)
-    for i, hit in enumerate(collisions):
-        if hit and i + 1 < len(collisions):
-            shifted[i + 1] = True
-    collisions = shifted
+    # shifted = [False] * len(collisions)
+    # for i, hit in enumerate(collisions):
+    #     if hit and i + 1 < len(collisions):
+    #         shifted[i + 1] = True
+    # collisions = shifted
 
     route["collisions"] = collisions
     return route
