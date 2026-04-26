@@ -26,6 +26,8 @@ app.add_middleware(
 
 SPILLS_PATH = Path(__file__).parent / "data" / "spills" / "spills.json"
 ROUTES_DIR = Path(__file__).parent / "data" / "routes"
+SHIPS_PATH = Path(__file__).parent / "data" / "ships" / "ships.json"
+FLAGGED_SHIPS_PATH = Path(__file__).parent / "data" / "flagged_ships" / "flagged_ships.json"
 SPILL_WINDOW_HOURS = 60
 SPILL_OUTPUT_STEP_S = 1800  # 30 min frames
 
@@ -142,7 +144,15 @@ def get_ship(ship_id: str):
 
 @app.get("/flaggedShips")
 def get_flagged_ships():
-    return {}
+    with open(FLAGGED_SHIPS_PATH) as f:
+        flagged = {entry["id"]: entry["flaggedDate"] for entry in json.load(f)}
+    with open(SHIPS_PATH) as f:
+        ships = json.load(f)
+    return [
+        {**ship, "flaggedDate": flagged[ship["id"]]}
+        for ship in ships
+        if ship["id"] in flagged
+    ]
 
 @app.get("/spills/{date}", response_model=list[SimulationResult])
 def get_spills_on_date(date: str):
