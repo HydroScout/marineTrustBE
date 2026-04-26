@@ -194,3 +194,12 @@ def get_spills_on_date(date: str):
         animations.append(result)
 
     return animations
+
+
+# ---------------------------------------------------------------------------
+# Waze for Sea (additive) — pre-trip risk prediction.
+# Mounted under /api/sea/*. Existing endpoints above are unchanged.
+# ---------------------------------------------------------------------------
+from sea import router as sea_router  # noqa: E402
+
+app.include_router(sea_router, prefix="/api/sea", tags=["sea"])
